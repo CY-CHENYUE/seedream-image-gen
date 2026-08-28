@@ -26,15 +26,18 @@ import struct
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 # ============================================================
 # 配置
 # ============================================================
 
-API_BASE = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+VOLCENGINE_API_BASE = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+ATLAS_API_BASE = "https://api.atlascloud.ai/api/v1"
+ATLAS_MODEL = "bytedance/seedream-v4"
 
 MODEL_MAP = {
     "seedream-4.0": "doubao-seedream-4-0-250828",
@@ -63,16 +66,22 @@ RETRY_DELAY = 3       # 重试间隔（秒）
 # 工具函数
 # ============================================================
 
-def get_api_key() -> str:
+def get_api_key(provider: str) -> str:
     """从环境变量获取 API Key。"""
-    key = os.environ.get("ARK_API_KEY") or os.environ.get("SEEDREAM_API_KEY")
+    if provider == "atlas":
+        key = os.environ.get("ATLASCLOUD_API_KEY")
+        env_name = "ATLASCLOUD_API_KEY"
+        key_url = "https://www.atlascloud.ai/"
+    else:
+        key = os.environ.get("ARK_API_KEY") or os.environ.get("SEEDREAM_API_KEY")
+        env_name = "ARK_API_KEY"
+        key_url = "https://console.volcengine.com/ark/region:ark+cn-beijing/apikey"
     if not key:
-        print("错误：未设置 ARK_API_KEY 环境变量。", file=sys.stderr)
+        print(f"错误：未设置 {env_name} 环境变量。", file=sys.stderr)
         print("", file=sys.stderr)
         print("配置方法：", file=sys.stderr)
-        print("  1. 获取 API Key：https://console.volcengine.com/ark/region:ark+cn-beijing/apikey", file=sys.stderr)
-        print("  2. 在 openclaw.json 中配置：", file=sys.stderr)
-        print('     { "skills": { "entries": { "seedream-image-gen": { "apiKey": "你的KEY" } } } }', file=sys.stderr)
+        print(f"  1. 获取 API Key：{key_url}", file=sys.stderr)
+        print(f"  2. 设置环境变量：export {env_name}=\"你的API_KEY\"", file=sys.stderr)
         sys.exit(1)
     return key
 
@@ -168,13 +177,32 @@ def format_file_size(size_bytes: int) -> str:
         return f"{size_bytes / (1024 * 1024):.2f} MB"
 
 
+def correct_image_suffix(filepath: Path) -> Path:
+    """让保存扩展名与下载内容一致，避免 JPEG 数据使用 .png 后缀。"""
+    with open(filepath, "rb") as image_file:
+        header = image_file.read(12)
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        suffix = ".png"
+    elif header.startswith(b"\xff\xd8"):
+        suffix = ".jpg"
+    elif header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        suffix = ".webp"
+    else:
+        return filepath
+    if filepath.suffix.lower() in ({".jpg", ".jpeg"} if suffix == ".jpg" else {suffix}):
+        return filepath
+    corrected = filepath.with_suffix(suffix)
+    filepath.replace(corrected)
+    return corrected
+
+
 def create_ssl_context() -> ssl.SSLContext:
     """创建 SSL 上下文，优先使用系统证书验证。"""
     ctx = ssl.create_default_context()
     return ctx
 
 
-def api_request(api_key: str, payload: dict) -> dict:
+def volcengine_api_request(api_key: str, payload: dict) -> dict:
     """发送 API 请求，支持自动重试。"""
     data = json.dumps(payload).encode("utf-8")
     headers = {
@@ -188,7 +216,7 @@ def api_request(api_key: str, payload: dict) -> dict:
 
     for attempt in range(MAX_RETRIES + 1):
         try:
-            req = urllib.request.Request(API_BASE, data=data, headers=headers)
+            req = urllib.request.Request(VOLCENGINE_API_BASE, data=data, headers=headers)
             with urllib.request.urlopen(req, timeout=300, context=ssl_ctx) as resp:
                 return json.loads(resp.read())
 
@@ -227,6 +255,98 @@ def api_request(api_key: str, payload: dict) -> dict:
             time.sleep(wait)
 
     raise Exception(last_error)
+
+
+def atlas_request(api_key: str, payload: dict) -> dict:
+    """提交一次 Atlas Cloud 生成请求；计费 POST 不自动重试。"""
+    req = urllib.request.Request(
+        f"{ATLAS_API_BASE}/model/generateImage",
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "OpenClaw-Seedream-Skill/1.1",
+        },
+        data=json.dumps(payload).encode("utf-8"),
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300, context=create_ssl_context()) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Atlas Cloud 接口错误 ({e.code}): {body[:500]}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Atlas Cloud 连接错误: {e.reason}") from e
+
+
+def atlas_prediction(api_key: str, request_id: str, max_polls: int = 100) -> dict:
+    """通过有界 GET 轮询等待 Atlas Cloud 任务完成。"""
+    encoded_id = urllib.parse.quote(request_id, safe="")
+    url = f"{ATLAS_API_BASE}/model/result/{encoded_id}"
+    for poll in range(max_polls):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "OpenClaw-Seedream-Skill/1.1",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60, context=create_ssl_context()) as resp:
+                result = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Atlas Cloud 查询错误 ({e.code}): {body[:500]}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Atlas Cloud 查询连接错误: {e.reason}") from e
+
+        prediction = result.get("data", result)
+        status = prediction.get("status", "")
+        if status == "completed":
+            return prediction
+        if status == "failed":
+            raise RuntimeError(prediction.get("error") or "Atlas Cloud 生成失败")
+        if poll + 1 < max_polls:
+            time.sleep(3)
+    raise TimeoutError("Atlas Cloud 生成超时（已停止轮询）")
+
+
+def atlas_size(size: Optional[str]) -> Optional[str]:
+    """将现有 WIDTHxHEIGHT/预设转换为 Atlas Seedream v4 的 WIDTH*HEIGHT。"""
+    if not size or size == "adaptive":
+        return None
+    presets = {"1K": "1024*1024", "2K": "2048*2048"}
+    if size == "4K":
+        raise ValueError("Atlas Cloud 的 Seedream v4 当前最大支持 2048*2048，请使用 2K 或更小尺寸")
+    normalized = presets.get(size, size.replace("x", "*"))
+    try:
+        width, height = (int(value) for value in normalized.split("*", 1))
+    except (TypeError, ValueError):
+        raise ValueError(f"Atlas Cloud 尺寸格式无效: {size}") from None
+    if width > 2048 or height > 2048:
+        raise ValueError("Atlas Cloud 的 Seedream v4 当前单边最大支持 2048 像素")
+    return normalized
+
+
+def atlas_generate(api_key: str, prompt: str, size: Optional[str], count: int) -> List[str]:
+    """使用 Atlas Cloud Seedream v4 生成图片 URL。"""
+    outputs = []
+    for _ in range(count):
+        payload = {"model": ATLAS_MODEL, "prompt": prompt}
+        normalized_size = atlas_size(size)
+        if normalized_size:
+            payload["size"] = normalized_size
+        submitted = atlas_request(api_key, payload)
+        prediction = submitted.get("data", submitted)
+        request_id = prediction.get("id")
+        if not request_id:
+            raise RuntimeError(f"Atlas Cloud 未返回任务 ID: {json.dumps(submitted, ensure_ascii=False)[:500]}")
+        completed = atlas_prediction(api_key, request_id)
+        urls = completed.get("outputs") or []
+        if not urls:
+            raise RuntimeError("Atlas Cloud 任务已完成，但未返回图片 URL")
+        outputs.extend(urls)
+    return outputs
 
 
 def download_image(url: str, output_path: Path) -> None:
@@ -268,6 +388,12 @@ def main():
     parser.add_argument("--prompt", "-p", required=True, help="图片描述或编辑指令")
     parser.add_argument("--filename", "-f", required=True, help="输出文件名（如 scene01.png）")
     parser.add_argument(
+        "--provider",
+        choices=["volcengine", "atlas"],
+        default="volcengine",
+        help="API 提供方（默认：volcengine；可选：atlas）",
+    )
+    parser.add_argument(
         "--model", "-m",
         default="seedream-5.0",
         choices=list(MODEL_MAP.keys()),
@@ -293,10 +419,20 @@ def main():
         print("错误：--count 必须在 1 到 4 之间。", file=sys.stderr)
         sys.exit(1)
 
-    api_key = get_api_key()
+    if args.provider == "atlas" and (
+        args.input_image or args.ref_images or args.seed is not None
+        or args.guidance is not None or args.no_watermark
+    ):
+        print(
+            "错误：Atlas Cloud 当前适配仅支持文生图、尺寸和批量数量参数。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    api_key = get_api_key(args.provider)
 
     # 构建请求参数
-    model_id = MODEL_MAP.get(args.model, args.model)
+    model_id = ATLAS_MODEL if args.provider == "atlas" else MODEL_MAP.get(args.model, args.model)
     size = resolve_size(args.size, args.aspect)
 
     payload = {
@@ -338,14 +474,18 @@ def main():
     # 开始生成
     aspect_info = f"（{args.aspect}）" if args.aspect else ""
     size_info = size or "默认"
-    print(f"正在生成 | 模型：{args.model} | 尺寸：{size_info}{aspect_info} | 数量：{args.count}")
+    print(f"正在生成 | 提供方：{args.provider} | 模型：{model_id} | 尺寸：{size_info}{aspect_info} | 数量：{args.count}")
     print(f"提示词：{args.prompt[:100]}{'...' if len(args.prompt) > 100 else ''}")
     print()
 
     start_time = time.time()
 
     try:
-        result = api_request(api_key, payload)
+        if args.provider == "atlas":
+            image_urls = atlas_generate(api_key, args.prompt, size, args.count)
+            result = {"data": [{"url": url} for url in image_urls]}
+        else:
+            result = volcengine_api_request(api_key, payload)
     except Exception as e:
         print(f"错误：{e}", file=sys.stderr)
         sys.exit(1)
@@ -386,6 +526,7 @@ def main():
         print(f"正在下载第 {idx + 1}/{len(data)} 张图片...")
         try:
             download_image(image_url, save_path)
+            save_path = correct_image_suffix(save_path)
             full_path = save_path.resolve()
             file_size = full_path.stat().st_size
             dimensions = get_image_dimensions(full_path)
@@ -404,7 +545,7 @@ def main():
     print()
     if saved_files:
         print(f"=== 生成完成 ===")
-        print(f"模型：{args.model}（{model_id}）")
+        print(f"提供方：{args.provider} | 模型：{model_id}")
         print(f"数量：{len(saved_files)} 张 | 耗时：{elapsed:.1f} 秒")
         if saved_files[0]["dimensions"]:
             w, h = saved_files[0]["dimensions"]

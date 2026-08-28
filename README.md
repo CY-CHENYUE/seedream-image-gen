@@ -1,6 +1,6 @@
 # 🎨 Seedream Image Gen — OpenClaw 图片生成技能
 
-使用字节跳动火山引擎 **Seedream API** 生成和编辑图片的 OpenClaw 技能。
+使用字节跳动火山引擎 **Seedream API** 生成和编辑图片的 OpenClaw 技能，也可选择通过 Atlas Cloud 调用 Seedream 文生图。
 
 ## 功能特性
 
@@ -11,6 +11,7 @@
 - **画面比例预设** — 内置 16:9、9:16、4:3 等常用比例，自动计算像素尺寸
 - **多模型支持** — Seedream 4.0 / 4.5 / 5.0 / SeedEdit 3.0
 - **最高 4K 分辨率**
+- **可选 Atlas Cloud 提供方** — 保持火山引擎为默认，不影响现有配置
 
 ## 安装
 
@@ -57,6 +58,21 @@ clawhub install seedream-image-gen
 ```bash
 export ARK_API_KEY="你的API_KEY"
 ```
+
+### 可选：Atlas Cloud
+
+Atlas Cloud 适配当前支持 Seedream v4 文生图、尺寸和批量数量参数。配置独立环境变量：
+
+```bash
+export ATLASCLOUD_API_KEY="你的API_KEY"
+python3 scripts/generate_image.py \
+  --provider atlas \
+  --prompt "温馨的咖啡店内部，暖色灯光" \
+  --filename "咖啡店.png"
+```
+
+Atlas Cloud 使用异步任务：生成请求只提交一次，随后通过有界状态查询等待结果。
+脚本会根据返回图片的真实格式修正文件后缀，例如将 JPEG 数据对应的 `.png` 请求名保存为 `.jpg`。
 
 ## 使用示例
 
@@ -117,6 +133,7 @@ python3 scripts/generate_image.py \
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
+| `--provider` | 提供方：`volcengine` / `atlas` | `volcengine` |
 | `--prompt` / `-p` | 图片描述（必填） | - |
 | `--filename` / `-f` | 输出文件名（必填） | - |
 | `--model` / `-m` | 模型：`seedream-4.0` / `seedream-4.5` / `seedream-5.0` / `seedream-5.0-lite` / `seededit-3.0` | `seedream-4.5` |
@@ -144,7 +161,7 @@ python3 scripts/generate_image.py \
 ## 依赖
 
 - **Python 3.7+**（无需额外第三方库，仅使用标准库）
-- **火山引擎 Ark API Key**
+- **火山引擎 Ark API Key**，或使用 Atlas Cloud 时配置 `ATLASCLOUD_API_KEY`
 
 ## 技术说明
 
@@ -161,6 +178,7 @@ python3 scripts/generate_image.py \
 | 接口 | 地址 | 发送的数据 |
 |------|------|-----------|
 | 火山引擎 Ark API | `https://ark.cn-beijing.volces.com/api/v3/images/generations` | prompt 文本、图片参数、API Key（认证头） |
+| Atlas Cloud API | `https://api.atlascloud.ai/api/v1/model/generateImage` | prompt 文本、模型、尺寸、API Key（认证头） |
 
 除上述接口外，不会向任何其他地址发送数据。
 

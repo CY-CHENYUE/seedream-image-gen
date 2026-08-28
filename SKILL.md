@@ -1,14 +1,16 @@
 ---
 name: seedream-image-gen
-description: 使用字节跳动 Seedream API 生成和编辑图片。支持文生图、图生图编辑、多图角色融合、批量生成。
-version: 1.0.0
+description: 使用 Seedream 生成和编辑图片。默认调用字节跳动火山引擎，也可通过 Atlas Cloud 进行文生图；支持图生图、多图融合和批量生成。
+version: 1.1.0
 tools: Bash, Read
-metadata: {"clawdbot":{"emoji":"🎨","primaryEnv":"ARK_API_KEY","homepage":"https://github.com/CY-CHENYUE/seedream-image-gen","requires":{"bins":["python3"],"env":["ARK_API_KEY"]}}}
+metadata: {"clawdbot":{"emoji":"🎨","primaryEnv":"ARK_API_KEY","homepage":"https://github.com/CY-CHENYUE/seedream-image-gen","requires":{"bins":["python3"]}}}
 ---
 
 # Seedream 图片生成
 
 使用字节跳动火山引擎 Seedream API 生成图片（同步接口，无需轮询）。
+
+默认提供方为 `volcengine`。当用户明确选择 Atlas Cloud 时，使用 `--provider atlas`；该路径当前支持 Seedream v4 文生图、尺寸和批量数量参数。
 
 ## 首次使用配置（最高优先级）
 
@@ -57,6 +59,20 @@ source ~/.seedream.env
 source ~/.seedream.env && python3 {baseDir}/scripts/generate_image.py --prompt "xxx" --filename "xxx.png"
 ```
 
+### Atlas Cloud 配置
+
+选择 Atlas Cloud 时检查 `ATLASCLOUD_API_KEY`，不要回显或写入仓库：
+
+```bash
+test -n "$ATLASCLOUD_API_KEY" && echo "ATLASCLOUD_API_KEY 已设置"
+python3 {baseDir}/scripts/generate_image.py \
+  --provider atlas \
+  --prompt "温馨的咖啡店内部，暖色灯光" \
+  --filename "咖啡店.png"
+```
+
+Atlas Cloud 生成任务只提交一次，脚本随后使用有界 GET 轮询等待结果，不自动重试计费 POST。
+
 ## 快速开始
 
 ```bash
@@ -84,6 +100,7 @@ python3 {baseDir}/scripts/generate_image.py \
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
+| `--provider` | 提供方：`volcengine`、`atlas` | `volcengine` |
 | `--prompt` | 图片描述（必填） | - |
 | `--filename` | 输出文件名（必填） | - |
 | `--model` | 模型选择：`seedream-4.0`、`seedream-4.5`、`seedream-5.0`、`seedream-5.0-lite`、`seededit-3.0` | `seedream-5.0` |
